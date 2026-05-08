@@ -4,6 +4,14 @@
 
 `v7.0.14`
 
+## Unreleased
+
+- Added `Watson.Clients`, a companion package in this repository for outbound websocket client usage
+- Added `WatsonWebSocketClient`, `WebSocketClientSettings`, `WebSocketClientStatistics`, and client-side `WebSocketMessage` with whole-message receive semantics and a raw `ClientWebSocket` escape hatch
+- Added exhaustive shared websocket-client coverage in `Test.Shared`, wired into both `Test.XUnit` and `Test.Automated`, and extended server/client interop validation through that suite
+- Updated `Test.WebsocketClient` to exercise `WatsonWebSocketClient` instead of raw `ClientWebSocket`
+- Expanded `README.md` and `MIGRATING_FROM_WATSONWEBSOCKET.md` so WatsonWebsocket client migrations now have first-class documentation alongside the server guidance
+
 ## v7.0.14
 
 - Fixed HTTP/1.1 disconnect detection so transport aborts on response writes mark the active request aborted, cancel the per-request token, raise `RequestAborted`, and raise the existing `RequestorDisconnected` event

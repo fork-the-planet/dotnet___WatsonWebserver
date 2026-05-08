@@ -7,6 +7,7 @@ Watson 7 is a simple, fast, async C# web server for building REST APIs and HTTP 
 | Package | NuGet Version | Downloads |
 |---|---|---|
 | Watson | [![NuGet Version](https://img.shields.io/nuget/v/Watson.svg?style=flat)](https://www.nuget.org/packages/Watson/) | [![NuGet](https://img.shields.io/nuget/dt/Watson.svg)](https://www.nuget.org/packages/Watson) |
+| Watson.Clients | [![NuGet Version](https://img.shields.io/nuget/v/Watson.Clients.svg?style=flat)](https://www.nuget.org/packages/Watson.Clients/) | [![NuGet](https://img.shields.io/nuget/dt/Watson.Clients.svg)](https://www.nuget.org/packages/Watson.Clients) |
 
 ## .NET Foundation
 
@@ -50,11 +51,19 @@ In summary:
 
 ## Install
 
+Server package:
+
 ```powershell
 dotnet add package Watson
 ```
 
-The `Watson` package contains everything needed for both server usage and extension development. The `WatsonWebserver.Core` namespace provides the shared abstractions, routing, and extensibility surface within the same package.
+WebSocket client package:
+
+```powershell
+dotnet add package Watson.Clients
+```
+
+Use `Watson` for server/runtime/extensibility scenarios. Use `Watson.Clients` when you need the Watson 7 outbound WebSocket client surface. The `WatsonWebserver.Core` namespace remains part of the `Watson` package for shared server abstractions and extension points.
 
 ### Supported Frameworks
 
@@ -343,7 +352,7 @@ server.Routes.PreAuthentication.Static.Add(HttpMethod.GET, "/legacy", async (ctx
 
 ### WebSockets
 
-Watson 7 includes native server-side WebSocket support.
+Watson 7 includes native server-side WebSocket support, and this repository also ships the companion `Watson.Clients` package for outbound WebSocket client usage.
 
 Current scope:
 
@@ -443,11 +452,38 @@ Important defaults:
 - Use `wss://` when SSL is enabled
 - The current implementation still uses the HTTP/1.1 upgrade path even when running over TLS
 
+### WebSocket client package
+
+`Watson.Clients` exposes `WatsonWebSocketClient`, an async-first client with whole-message receive semantics, headers/cookies/subprotocol configuration, client GUID header support, optional invalid-certificate acceptance, and an advanced raw `ClientWebSocket` escape hatch through `RawSocket`.
+
+See [src/Watson.Clients/README.md](src/Watson.Clients/README.md) for the focused client guide and [MIGRATING_FROM_WATSONWEBSOCKET.md](MIGRATING_FROM_WATSONWEBSOCKET.md) for WatsonWebsocket migration guidance.
+
+Example:
+
+```csharp
+using System;
+using System.Net.WebSockets;
+using Watson.Clients;
+
+WebSocketClientSettings settings = new WebSocketClientSettings();
+settings.Headers["x-demo"] = "watson";
+
+using WatsonWebSocketClient client = new WatsonWebSocketClient(
+    new Uri("ws://127.0.0.1:8181/ws/echo"),
+    settings);
+
+await client.ConnectAsync();
+await client.SendTextAsync("hello");
+WebSocketMessage reply = await client.ReceiveAsync();
+Console.WriteLine(reply.Text);
+await client.CloseAsync(WebSocketCloseStatus.NormalClosure, "done");
+```
+
 ### Current limitations
 
 - WebSocket support is HTTP/1.1-only in the current implementation
 - `WebSocketSettings.EnableHttp2` and `EnableHttp3` are present for future protocol expansion and do not enable HTTP/2 or HTTP/3 websocket runtime support today
-- No raw underlying `System.Net.WebSockets.WebSocket` is exposed publicly
+- Server-side `WebSocketSession` does not expose the raw underlying `System.Net.WebSockets.WebSocket` publicly; the companion client package exposes raw `ClientWebSocket` access through `WatsonWebSocketClient.RawSocket`
 - Receive semantics are message-oriented and session-owned
 - Optional subprotocol negotiation support is not yet exposed as a public configuration surface
 
@@ -1068,6 +1104,7 @@ Automated validation is covered by:
 - `src/Test.Automated`: integration tests with real HTTP requests against a running server
 - `src/Test.XUnit`: CI-oriented test runner that executes shared test logic from `Test.Shared` without invoking `Test.Automated`
 - `src/Test.RestApi`: interactive server demonstrating all API route features (run and test manually with curl/Postman)
+- `src/Test.WebsocketClient`: interactive websocket client demonstrating `WatsonWebSocketClient`
 - `src/Test.Benchmark`: benchmark harness for cross-target and cross-protocol performance comparisons
 
 Recommended commands:

@@ -1,23 +1,24 @@
 namespace Test.WebsocketClient
 {
     using System;
-    using System.Buffers;
     using System.Collections.Generic;
-    using System.Linq;
     using System.Net.WebSockets;
     using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
+    using Watson.Clients;
 
     internal static class Program
     {
         private static readonly object _ConsoleSync = new object();
-        private static ClientWebSocket _Socket = null;
+        private static WatsonWebSocketClient _Client = null;
         private static CancellationTokenSource _ReceiveCts = null;
         private static Task _ReceiveTask = null;
         private static string _Uri = "ws://127.0.0.1:8181/ws/echo";
         private static readonly Dictionary<string, string> _Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private static readonly List<string> _Subprotocols = new List<string>();
+        private static bool _AcceptInvalidCertificates = false;
+        private static Guid? _ClientGuid = null;
 
         private static async Task Main(string[] args)
         {
@@ -49,6 +50,13 @@ namespace Test.WebsocketClient
                     case "subprotocols":
                     case "subproto":
                         ManageSubprotocols();
+                        break;
+                    case "tls":
+                    case "certs":
+                        ManageTlsValidation();
+                        break;
+                    case "guid":
+                        ManageClientGuid();
                         break;
                     case "connect":
                         await ConnectAsync().ConfigureAwait(false);
@@ -138,6 +146,7 @@ namespace Test.WebsocketClient
         private static void PrintBanner()
         {
             WriteLine("Watson websocket sample client");
+            WriteLine("Implementation: WatsonWebSocketClient from Watson.Clients");
             WriteLine("Default URI: " + _Uri);
             WriteLine("");
             PrintMenu();
@@ -151,6 +160,8 @@ namespace Test.WebsocketClient
             WriteLine("  uri         set a custom websocket URI");
             WriteLine("  headers     manage request headers");
             WriteLine("  subproto    manage requested subprotocols");
+            WriteLine("  tls         toggle invalid-certificate acceptance");
+            WriteLine("  guid        set or clear the client-supplied GUID header");
             WriteLine("  connect     connect to the current URI");
             WriteLine("  disconnect  close the active connection and tear down local state");
             WriteLine("  text        send a UTF-8 text message");
@@ -215,7 +226,7 @@ namespace Test.WebsocketClient
 
         private static async Task ConnectAsync()
         {
-            if (_Socket != null && _Socket.State == WebSocketState.Open)
+            if (_Client != null && _Client.IsConnected)
             {
                 WriteLine("Already connected.");
                 return;
@@ -223,15 +234,19 @@ namespace Test.WebsocketClient
 
             await DisconnectAsync().ConfigureAwait(false);
 
-            _Socket = new ClientWebSocket();
             _ReceiveCts = new CancellationTokenSource();
-            ApplyConnectionOptions(_Socket);
+            _Client = BuildClient();
 
             try
             {
-                await _Socket.ConnectAsync(new Uri(_Uri), CancellationToken.None).ConfigureAwait(false);
-                _ReceiveTask = Task.Run(() => ReceiveLoopAsync(_Socket, _ReceiveCts.Token));
+                await _Client.ConnectAsync(CancellationToken.None).ConfigureAwait(false);
+                _ReceiveTask = Task.Run(() => ReceiveLoopAsync(_Client, _ReceiveCts.Token));
                 WriteLine("Connected to " + _Uri);
+
+                if (!String.IsNullOrWhiteSpace(_Client.Subprotocol))
+                {
+                    WriteLine("Negotiated subprotocol: " + _Client.Subprotocol);
+                }
             }
             catch (Exception e)
             {
@@ -242,42 +257,58 @@ namespace Test.WebsocketClient
 
         private static async Task DisconnectAsync()
         {
-            ClientWebSocket socket = _Socket;
+            WatsonWebSocketClient client = _Client;
             CancellationTokenSource receiveCts = _ReceiveCts;
             Task receiveTask = _ReceiveTask;
 
-            _Socket = null;
+            _Client = null;
             _ReceiveCts = null;
             _ReceiveTask = null;
 
             if (receiveCts != null)
             {
-                try { receiveCts.Cancel(); } catch (ObjectDisposedException) { }
+                try
+                {
+                    receiveCts.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
             }
 
-            if (socket != null)
+            if (client != null)
             {
                 try
                 {
-                    if (socket.State == WebSocketState.Open || socket.State == WebSocketState.CloseReceived)
+                    if (client.IsConnected)
                     {
-                        await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "client disconnect", CancellationToken.None).ConfigureAwait(false);
+                        await client.CloseAsync(WebSocketCloseStatus.NormalClosure, "client disconnect", CancellationToken.None).ConfigureAwait(false);
                     }
                 }
                 catch (Exception)
                 {
-                    try { socket.Abort(); } catch (Exception) { }
                 }
-
-                socket.Dispose();
+                finally
+                {
+                    client.Dispose();
+                }
             }
 
             if (receiveTask != null)
             {
-                try { await receiveTask.ConfigureAwait(false); } catch (Exception) { }
+                try
+                {
+                    await receiveTask.ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                }
             }
 
-            if (receiveCts != null) receiveCts.Dispose();
+            if (receiveCts != null)
+            {
+                receiveCts.Dispose();
+            }
         }
 
         private static async Task SendTextAsync()
@@ -286,8 +317,7 @@ namespace Test.WebsocketClient
 
             Console.Write("Text payload> ");
             string payload = Console.ReadLine() ?? String.Empty;
-            byte[] bytes = Encoding.UTF8.GetBytes(payload);
-            await _Socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
+            await _Client.SendTextAsync(payload, CancellationToken.None).ConfigureAwait(false);
             WriteLine("[sent text] " + payload);
         }
 
@@ -298,7 +328,7 @@ namespace Test.WebsocketClient
             Console.Write("Binary payload (UTF-8 source text)> ");
             string payload = Console.ReadLine() ?? String.Empty;
             byte[] bytes = Encoding.UTF8.GetBytes(payload);
-            await _Socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Binary, true, CancellationToken.None).ConfigureAwait(false);
+            await _Client.SendBinaryAsync(bytes, CancellationToken.None).ConfigureAwait(false);
             WriteLine("[sent binary] " + bytes.Length + " bytes");
         }
 
@@ -320,14 +350,13 @@ namespace Test.WebsocketClient
 
             Console.Write("Append index suffix? [Y/n]> ");
             string suffixChoice = (Console.ReadLine() ?? String.Empty).Trim();
-            bool appendIndex = !suffixChoice.Equals("n", StringComparison.OrdinalIgnoreCase) &&
-                !suffixChoice.Equals("no", StringComparison.OrdinalIgnoreCase);
+            bool appendIndex = !suffixChoice.Equals("n", StringComparison.OrdinalIgnoreCase)
+                && !suffixChoice.Equals("no", StringComparison.OrdinalIgnoreCase);
 
             for (int i = 0; i < count; i++)
             {
                 string outbound = appendIndex ? payload + " #" + (i + 1) : payload;
-                byte[] bytes = Encoding.UTF8.GetBytes(outbound);
-                await _Socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
+                await _Client.SendTextAsync(outbound, CancellationToken.None).ConfigureAwait(false);
             }
 
             WriteLine("[sent text burst] " + count + " messages");
@@ -351,91 +380,66 @@ namespace Test.WebsocketClient
             string reason = Console.ReadLine();
             if (String.IsNullOrWhiteSpace(reason)) reason = "client close";
 
-            await _Socket.CloseAsync(closeStatus, reason, CancellationToken.None).ConfigureAwait(false);
+            await _Client.CloseAsync(closeStatus, reason, CancellationToken.None).ConfigureAwait(false);
             WriteLine("[close sent] " + closeStatus + " " + reason);
         }
 
         private static void PrintState()
         {
-            if (_Socket == null)
+            if (_Client == null)
             {
-                WriteLine("Socket: (null)");
-                WriteLine("URI: " + _Uri);
+                WriteLine("Client: (null)");
+                PrintConfigurationState();
                 return;
             }
 
-            WriteLine("Socket state: " + _Socket.State);
-            WriteLine("Close status: " + (_Socket.CloseStatus?.ToString() ?? "(null)"));
-            WriteLine("Close description: " + (_Socket.CloseStatusDescription ?? "(null)"));
-            WriteLine("URI: " + _Uri);
-            WriteLine("Headers: " + (_Headers.Count > 0 ? String.Join(", ", _Headers.Select(kvp => kvp.Key + "=" + kvp.Value)) : "(none)"));
-            WriteLine("Subprotocols: " + (_Subprotocols.Count > 0 ? String.Join(", ", _Subprotocols) : "(none)"));
+            WebSocketClientStatistics stats = _Client.Statistics.Snapshot();
+
+            WriteLine("Socket state: " + _Client.State);
+            WriteLine("Close status: " + (_Client.CloseStatus?.ToString() ?? "(null)"));
+            WriteLine("Close description: " + (_Client.CloseStatusDescription ?? "(null)"));
+            WriteLine("Subprotocol: " + (_Client.Subprotocol ?? "(null)"));
+            WriteLine("Raw socket state: " + (_Client.RawSocket?.State.ToString() ?? "(null)"));
+            WriteLine("Messages sent: " + stats.MessagesSent);
+            WriteLine("Messages received: " + stats.MessagesReceived);
+            WriteLine("Bytes sent: " + stats.BytesSent);
+            WriteLine("Bytes received: " + stats.BytesReceived);
+            PrintConfigurationState();
         }
 
-        private static async Task ReceiveLoopAsync(ClientWebSocket socket, CancellationToken token)
+        private static async Task ReceiveLoopAsync(WatsonWebSocketClient client, CancellationToken token)
         {
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(8192);
             try
             {
-                while (!token.IsCancellationRequested && socket != null)
+                await foreach (WebSocketMessage message in client.ReadMessagesAsync(token).ConfigureAwait(false))
                 {
-                    int offset = 0;
-                    WebSocketMessageType messageType = WebSocketMessageType.Text;
-
-                    while (true)
+                    if (message.MessageType == WebSocketMessageType.Text)
                     {
-                        WebSocketReceiveResult result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer, offset, buffer.Length - offset), token).ConfigureAwait(false);
-                        messageType = result.MessageType;
-
-                        if (result.MessageType == WebSocketMessageType.Close)
-                        {
-                            WriteLine("[recv close] " + result.CloseStatus + " " + (result.CloseStatusDescription ?? String.Empty));
-                            return;
-                        }
-
-                        offset += result.Count;
-                        if (result.EndOfMessage)
-                        {
-                            break;
-                        }
-
-                        if (offset >= buffer.Length)
-                        {
-                            WriteLine("[recv] message exceeded local buffer");
-                            return;
-                        }
-                    }
-
-                    if (messageType == WebSocketMessageType.Text)
-                    {
-                        WriteLine("[recv text] " + Encoding.UTF8.GetString(buffer, 0, offset));
+                        WriteLine("[recv text] " + message.Text);
                     }
                     else
                     {
-                        WriteLine("[recv binary] " + BitConverter.ToString(buffer, 0, offset));
+                        WriteLine("[recv binary] " + BitConverter.ToString(message.Data));
                     }
                 }
+
+                WriteLine("[recv close] " + (client.CloseStatus?.ToString() ?? "(null)") + " " + (client.CloseStatusDescription ?? String.Empty));
             }
             catch (OperationCanceledException)
             {
             }
-            catch (WebSocketException e)
+            catch (ObjectDisposedException)
             {
-                WriteLine("[recv error] " + e.Message);
             }
             catch (Exception e)
             {
                 WriteLine("[recv error] " + e.Message);
             }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
         }
 
         private static bool EnsureConnected()
         {
-            if (_Socket == null || _Socket.State != WebSocketState.Open)
+            if (_Client == null || !_Client.IsConnected)
             {
                 WriteLine("Not connected.");
                 return false;
@@ -510,7 +514,17 @@ namespace Test.WebsocketClient
                         return;
                     }
 
-                    if (!_Subprotocols.Contains(add, StringComparer.OrdinalIgnoreCase))
+                    bool exists = false;
+                    for (int i = 0; i < _Subprotocols.Count; i++)
+                    {
+                        if (String.Equals(_Subprotocols[i], add, StringComparison.OrdinalIgnoreCase))
+                        {
+                            exists = true;
+                            break;
+                        }
+                    }
+
+                    if (!exists)
                     {
                         _Subprotocols.Add(add);
                     }
@@ -533,18 +547,94 @@ namespace Test.WebsocketClient
             }
         }
 
-        private static void ApplyConnectionOptions(ClientWebSocket socket)
+        private static void ManageTlsValidation()
         {
-            if (socket == null) throw new ArgumentNullException(nameof(socket));
+            WriteLine("Accept invalid certificates: " + (_AcceptInvalidCertificates ? "enabled" : "disabled"));
+            Console.Write("Toggle? [y/N]> ");
+            string choice = (Console.ReadLine() ?? String.Empty).Trim();
+
+            if (choice.Equals("y", StringComparison.OrdinalIgnoreCase) || choice.Equals("yes", StringComparison.OrdinalIgnoreCase))
+            {
+                _AcceptInvalidCertificates = !_AcceptInvalidCertificates;
+                WriteLine("Accept invalid certificates: " + (_AcceptInvalidCertificates ? "enabled" : "disabled"));
+            }
+            else
+            {
+                WriteLine("No changes made.");
+            }
+        }
+
+        private static void ManageClientGuid()
+        {
+            WriteLine("Client GUID: " + (_ClientGuid.HasValue ? _ClientGuid.Value.ToString() : "(none)"));
+            Console.Write("GUID command [set/new/clear]> ");
+            string command = (Console.ReadLine() ?? String.Empty).Trim().ToLowerInvariant();
+
+            switch (command)
+            {
+                case "set":
+                    Console.Write("GUID value> ");
+                    string input = (Console.ReadLine() ?? String.Empty).Trim();
+                    if (!Guid.TryParse(input, out Guid parsed))
+                    {
+                        WriteLine("Invalid GUID.");
+                        return;
+                    }
+
+                    _ClientGuid = parsed;
+                    WriteLine("Client GUID set.");
+                    break;
+                case "new":
+                    _ClientGuid = Guid.NewGuid();
+                    WriteLine("Client GUID set to " + _ClientGuid.Value);
+                    break;
+                case "clear":
+                    _ClientGuid = null;
+                    WriteLine("Client GUID cleared.");
+                    break;
+                default:
+                    WriteLine("No changes made.");
+                    break;
+            }
+        }
+
+        private static WatsonWebSocketClient BuildClient()
+        {
+            WebSocketClientSettings settings = new WebSocketClientSettings();
+            settings.AcceptInvalidCertificates = _AcceptInvalidCertificates;
+
+            if (_ClientGuid.HasValue)
+            {
+                settings.ClientGuid = _ClientGuid.Value;
+            }
 
             foreach (KeyValuePair<string, string> header in _Headers)
             {
-                socket.Options.SetRequestHeader(header.Key, header.Value);
+                settings.Headers[header.Key] = header.Value;
             }
 
             for (int i = 0; i < _Subprotocols.Count; i++)
             {
-                socket.Options.AddSubProtocol(_Subprotocols[i]);
+                settings.RequestedSubprotocols.Add(_Subprotocols[i]);
+            }
+
+            return new WatsonWebSocketClient(new Uri(_Uri), settings);
+        }
+
+        private static void PrintConfigurationState()
+        {
+            WriteLine("URI: " + _Uri);
+            WriteLine("Headers: " + (_Headers.Count > 0 ? String.Join(", ", BuildHeaderDisplay()) : "(none)"));
+            WriteLine("Subprotocols: " + (_Subprotocols.Count > 0 ? String.Join(", ", _Subprotocols) : "(none)"));
+            WriteLine("Accept invalid certificates: " + _AcceptInvalidCertificates);
+            WriteLine("Client GUID: " + (_ClientGuid.HasValue ? _ClientGuid.Value.ToString() : "(none)"));
+        }
+
+        private static IEnumerable<string> BuildHeaderDisplay()
+        {
+            foreach (KeyValuePair<string, string> header in _Headers)
+            {
+                yield return header.Key + "=" + header.Value;
             }
         }
 
