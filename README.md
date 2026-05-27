@@ -1,4 +1,4 @@
-![Watson](https://github.com/jchristn/WatsonWebserver/blob/master/assets/watson.ico)
+![Watson](https://raw.githubusercontent.com/dotnet/WatsonWebserver/main/assets/watson.ico)
 
 # Watson Webserver
 
