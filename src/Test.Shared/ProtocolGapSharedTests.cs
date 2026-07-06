@@ -270,6 +270,110 @@ namespace Test.Shared
             }).ConfigureAwait(false);
         }
 
+        /// <summary>
+        /// Verifies that an HTTP/1.1 caller disconnect cancels the active request token before response write.
+        /// </summary>
+        /// <returns>Task.</returns>
+        public static async Task RunHttp1CallerDisconnectCancelsActiveRequestAsync()
+        {
+            await ExecuteWithRetryAsync(async () =>
+            {
+                TaskCompletionSource<bool> routeEntered = CreateTaskCompletionSource<bool>();
+                TaskCompletionSource<bool> tokenCancelled = CreateTaskCompletionSource<bool>();
+                TaskCompletionSource<bool> requestAborted = CreateTaskCompletionSource<bool>();
+                TaskCompletionSource<bool> requestorDisconnected = CreateTaskCompletionSource<bool>();
+
+                using (LoopbackServerHost host = new LoopbackServerHost(false, false, false, server =>
+                {
+                    ConfigureDisconnectRoutes(server, routeEntered, tokenCancelled, requestAborted, requestorDisconnected);
+                }))
+                {
+                    await host.StartAsync().ConfigureAwait(false);
+
+                    using (TcpClient client = new TcpClient())
+                    {
+                        await client.ConnectAsync("127.0.0.1", host.Port).ConfigureAwait(false);
+                        NetworkStream stream = client.GetStream();
+                        byte[] requestBytes = Encoding.ASCII.GetBytes(
+                            "GET /test/disconnect-wait HTTP/1.1\r\n" +
+                            "Host: 127.0.0.1:" + host.Port.ToString() + "\r\n" +
+                            "Connection: keep-alive\r\n" +
+                            "\r\n");
+
+                        await stream.WriteAsync(requestBytes, 0, requestBytes.Length).ConfigureAwait(false);
+                        await stream.FlushAsync().ConfigureAwait(false);
+                        await WaitForTaskAsync(routeEntered.Task, "HTTP/1.1 route did not start.").ConfigureAwait(false);
+
+                        client.Client.Shutdown(SocketShutdown.Both);
+                    }
+
+                    await WaitForTaskAsync(tokenCancelled.Task, "HTTP/1.1 route token was not canceled after caller disconnect.").ConfigureAwait(false);
+                    await WaitForTaskAsync(requestAborted.Task, "HTTP/1.1 RequestAborted event did not fire.").ConfigureAwait(false);
+                    await WaitForTaskAsync(requestorDisconnected.Task, "HTTP/1.1 RequestorDisconnected event did not fire.").ConfigureAwait(false);
+                }
+            }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Verifies that an HTTP/2 RST_STREAM cancels the active request token and emits disconnect events.
+        /// </summary>
+        /// <returns>Task.</returns>
+        public static async Task RunHttp2RstStreamCancelsActiveRequestAsync()
+        {
+            await ExecuteWithRetryAsync(async () =>
+            {
+                TaskCompletionSource<bool> routeEntered = CreateTaskCompletionSource<bool>();
+                TaskCompletionSource<bool> tokenCancelled = CreateTaskCompletionSource<bool>();
+                TaskCompletionSource<bool> requestAborted = CreateTaskCompletionSource<bool>();
+                TaskCompletionSource<bool> requestorDisconnected = CreateTaskCompletionSource<bool>();
+
+                using (LoopbackServerHost host = new LoopbackServerHost(false, true, false, server =>
+                {
+                    ConfigureDisconnectRoutes(server, routeEntered, tokenCancelled, requestAborted, requestorDisconnected);
+                }))
+                {
+                    await host.StartAsync().ConfigureAwait(false);
+
+                    using (TcpClient client = new TcpClient())
+                    {
+                        await client.ConnectAsync("127.0.0.1", host.Port).ConfigureAwait(false);
+
+                        using (NetworkStream stream = client.GetStream())
+                        {
+                            await PerformHttp2ClientHandshakeAsync(stream).ConfigureAwait(false);
+
+                            byte[] requestHeaderBytes = BuildHttp2RequestHeaderBlock("GET", "http", "127.0.0.1:" + host.Port.ToString(), "/test/disconnect-wait");
+                            Http2RawFrame requestFrame = new Http2RawFrame(
+                                new Http2FrameHeader
+                                {
+                                    Length = requestHeaderBytes.Length,
+                                    Type = Http2FrameType.Headers,
+                                    Flags = (byte)((byte)Http2FrameFlags.EndHeaders | (byte)Http2FrameFlags.EndStreamOrAck),
+                                    StreamIdentifier = 1
+                                },
+                                requestHeaderBytes);
+
+                            byte[] requestWireBytes = Http2FrameSerializer.SerializeFrame(requestFrame);
+                            await stream.WriteAsync(requestWireBytes, 0, requestWireBytes.Length).ConfigureAwait(false);
+                            await stream.FlushAsync().ConfigureAwait(false);
+                            await WaitForTaskAsync(routeEntered.Task, "HTTP/2 route did not start.").ConfigureAwait(false);
+
+                            Http2RstStreamFrame resetFrame = new Http2RstStreamFrame();
+                            resetFrame.StreamIdentifier = 1;
+                            resetFrame.ErrorCode = Http2ErrorCode.Cancel;
+                            byte[] resetWireBytes = Http2FrameSerializer.SerializeFrame(Http2FrameSerializer.CreateRstStreamFrame(resetFrame));
+                            await stream.WriteAsync(resetWireBytes, 0, resetWireBytes.Length).ConfigureAwait(false);
+                            await stream.FlushAsync().ConfigureAwait(false);
+                        }
+                    }
+
+                    await WaitForTaskAsync(tokenCancelled.Task, "HTTP/2 route token was not canceled after RST_STREAM.").ConfigureAwait(false);
+                    await WaitForTaskAsync(requestAborted.Task, "HTTP/2 RequestAborted event did not fire.").ConfigureAwait(false);
+                    await WaitForTaskAsync(requestorDisconnected.Task, "HTTP/2 RequestorDisconnected event did not fire.").ConfigureAwait(false);
+                }
+            }).ConfigureAwait(false);
+        }
+
         private static void ConfigureCommonRoutes(Webserver server)
         {
             if (server == null) throw new ArgumentNullException(nameof(server));
@@ -338,6 +442,57 @@ namespace Test.Shared
                 response.Path = req.Http.Request.Url.RawWithoutQuery;
                 return response;
             }, auth: true);
+        }
+
+        private static void ConfigureDisconnectRoutes(
+            Webserver server,
+            TaskCompletionSource<bool> routeEntered,
+            TaskCompletionSource<bool> tokenCancelled,
+            TaskCompletionSource<bool> requestAborted,
+            TaskCompletionSource<bool> requestorDisconnected)
+        {
+            if (server == null) throw new ArgumentNullException(nameof(server));
+            if (routeEntered == null) throw new ArgumentNullException(nameof(routeEntered));
+            if (tokenCancelled == null) throw new ArgumentNullException(nameof(tokenCancelled));
+            if (requestAborted == null) throw new ArgumentNullException(nameof(requestAborted));
+            if (requestorDisconnected == null) throw new ArgumentNullException(nameof(requestorDisconnected));
+
+            server.Events.RequestAborted += (sender, args) =>
+            {
+                if (IsDisconnectWaitEvent(args))
+                {
+                    requestAborted.TrySetResult(true);
+                }
+            };
+
+            server.Events.RequestorDisconnected += (sender, args) =>
+            {
+                if (IsDisconnectWaitEvent(args))
+                {
+                    requestorDisconnected.TrySetResult(true);
+                }
+            };
+
+            server.Routes.PreAuthentication.Static.Add(CoreHttpMethod.GET, "/test/disconnect-wait", async (ctx) =>
+            {
+                routeEntered.TrySetResult(true);
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(30), ctx.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    tokenCancelled.TrySetResult(true);
+                }
+            });
+        }
+
+        private static bool IsDisconnectWaitEvent(RequestEventArgs args)
+        {
+            return args != null
+                && !String.IsNullOrEmpty(args.Url)
+                && args.Url.IndexOf("/test/disconnect-wait", StringComparison.Ordinal) >= 0;
         }
 
         private static async Task AssertSecureRouteAsync(Uri baseAddress, Version version)
@@ -469,6 +624,26 @@ namespace Test.Shared
             }
 
             throw lastException ?? new InvalidOperationException("Retryable shared protocol test failed without an exception.");
+        }
+
+        private static async Task WaitForTaskAsync(Task task, string failureMessage)
+        {
+            if (task == null) throw new ArgumentNullException(nameof(task));
+            if (String.IsNullOrEmpty(failureMessage)) throw new ArgumentNullException(nameof(failureMessage));
+
+            Task timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+            Task completedTask = await Task.WhenAny(task, timeoutTask).ConfigureAwait(false);
+            if (completedTask != task)
+            {
+                throw new TimeoutException(failureMessage);
+            }
+
+            await task.ConfigureAwait(false);
+        }
+
+        private static TaskCompletionSource<T> CreateTaskCompletionSource<T>()
+        {
+            return new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         }
 
         private static async Task<Http2RawFrame> PerformHttp2ClientHandshakeAsync(NetworkStream stream)

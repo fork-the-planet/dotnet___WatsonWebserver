@@ -2,7 +2,7 @@
 
 ## Current Version
 
-`v7.0.14`
+`v7.0.15`
 
 ## Unreleased
 
@@ -11,6 +11,11 @@
 - Added exhaustive shared websocket-client coverage in `Test.Shared`, wired into both `Test.XUnit` and `Test.Automated`, and extended server/client interop validation through that suite
 - Updated `Test.WebsocketClient` to exercise `WatsonWebSocketClient` instead of raw `ClientWebSocket`
 - Expanded `README.md` and `MIGRATING_FROM_WATSONWEBSOCKET.md` so WatsonWebsocket client migrations now have first-class documentation alongside the server guidance
+
+## v7.0.15
+
+- Fixed active in-flight caller disconnect propagation so HTTP/1.1 socket disconnects, HTTP/2 `RST_STREAM` frames, and HTTP/3 response-side stream closures cancel the active request token and raise `RequestAborted` / `RequestorDisconnected` while route handlers are still running
+- Added shared protocol regression coverage for HTTP/1.1 caller disconnects and HTTP/2 `RST_STREAM` cancellation, wired into both `Test.Automated` and `Test.XUnit`
 
 ## v7.0.14
 

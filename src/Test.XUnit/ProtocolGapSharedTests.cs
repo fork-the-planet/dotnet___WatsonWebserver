@@ -24,6 +24,26 @@ namespace Test.XUnit
         }
 
         /// <summary>
+        /// Verify HTTP/1.1 caller disconnect cancels an active request.
+        /// </summary>
+        /// <returns>Task.</returns>
+        [Fact]
+        public async Task Http1CallerDisconnectCancelsActiveRequest()
+        {
+            await Test.Shared.ProtocolGapSharedTests.RunHttp1CallerDisconnectCancelsActiveRequestAsync();
+        }
+
+        /// <summary>
+        /// Verify HTTP/2 RST_STREAM cancels an active request.
+        /// </summary>
+        /// <returns>Task.</returns>
+        [Fact]
+        public async Task Http2RstStreamCancelsActiveRequest()
+        {
+            await Test.Shared.ProtocolGapSharedTests.RunHttp2RstStreamCancelsActiveRequestAsync();
+        }
+
+        /// <summary>
         /// Verify HTTP/3 transport backpressure behavior.
         /// </summary>
         /// <returns>Task.</returns>

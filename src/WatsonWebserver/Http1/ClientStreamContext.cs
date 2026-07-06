@@ -2,6 +2,7 @@ namespace WatsonWebserver.Http1
 {
     using System;
     using System.IO;
+    using System.Net.Sockets;
     using WatsonWebserver.Core;
 
     /// <summary>
@@ -13,6 +14,11 @@ namespace WatsonWebserver.Http1
         /// Negotiated application protocol.
         /// </summary>
         public HttpProtocol Protocol { get; set; } = HttpProtocol.Http1;
+
+        /// <summary>
+        /// Underlying client socket.
+        /// </summary>
+        public Socket Socket { get; set; } = null;
 
         /// <summary>
         /// Client stream.

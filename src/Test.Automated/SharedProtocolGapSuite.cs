@@ -25,6 +25,8 @@ namespace Test.Automated
             _Results.Clear();
 
             await ExecuteTestAsync("HTTP/2 :: Writer Serialization Correctness", ProtocolGapSharedTests.RunHttp2WriterSerializationCorrectnessAsync).ConfigureAwait(false);
+            await ExecuteTestAsync("HTTP/1.1 :: Caller Disconnect Cancels Active Request", ProtocolGapSharedTests.RunHttp1CallerDisconnectCancelsActiveRequestAsync).ConfigureAwait(false);
+            await ExecuteTestAsync("HTTP/2 :: RST_STREAM Cancels Active Request", ProtocolGapSharedTests.RunHttp2RstStreamCancelsActiveRequestAsync).ConfigureAwait(false);
             await ExecuteTestAsync("HTTP/3 :: Transport Backpressure Behavior", ProtocolGapSharedTests.RunHttp3TransportBackpressureAsync).ConfigureAwait(false);
             await ExecuteTestAsync("HTTP/3 :: Sibling Stream Survival After Abort", ProtocolGapSharedTests.RunHttp3SiblingStreamSurvivalAsync).ConfigureAwait(false);
             await ExecuteTestAsync("Cross-Protocol :: Auth, Session, And Event Parity", ProtocolGapSharedTests.RunCrossProtocolAuthSessionEventParityAsync).ConfigureAwait(false);
