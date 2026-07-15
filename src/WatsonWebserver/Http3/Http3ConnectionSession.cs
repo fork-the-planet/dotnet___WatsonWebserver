@@ -28,21 +28,25 @@ namespace WatsonWebserver.Http3
         /// <param name="events">Server events.</param>
         /// <param name="connection">QUIC connection.</param>
         /// <param name="processContext">Shared request processor.</param>
+        /// <param name="markRequestTerminated">Request termination callback.</param>
         public Http3ConnectionSession(
             WebserverSettings settings,
             WebserverEvents events,
             QuicConnection connection,
-            Func<HttpContextBase, CancellationToken, Task> processContext)
+            Func<HttpContextBase, CancellationToken, Task> processContext,
+            Action<HttpContextBase, bool> markRequestTerminated)
         {
             if (settings == null) throw new ArgumentNullException(nameof(settings));
             if (events == null) throw new ArgumentNullException(nameof(events));
             if (connection == null) throw new ArgumentNullException(nameof(connection));
             if (processContext == null) throw new ArgumentNullException(nameof(processContext));
+            if (markRequestTerminated == null) throw new ArgumentNullException(nameof(markRequestTerminated));
 
             _Settings = settings;
             _Events = events;
             _Connection = connection;
             _ProcessContext = processContext;
+            _MarkRequestTerminated = markRequestTerminated;
             _SourceIpAddress = connection.RemoteEndPoint.Address.ToString();
             _DestinationIpAddress = connection.LocalEndPoint.Address.ToString();
         }
@@ -51,10 +55,12 @@ namespace WatsonWebserver.Http3
         private readonly WebserverEvents _Events;
         private readonly QuicConnection _Connection;
         private readonly Func<HttpContextBase, CancellationToken, Task> _ProcessContext;
+        private readonly Action<HttpContextBase, bool> _MarkRequestTerminated;
         private readonly string _SourceIpAddress;
         private readonly string _DestinationIpAddress;
         private readonly object _Lock = new object();
         private readonly List<Task> _ActiveStreamTasks = new List<Task>();
+        private readonly Dictionary<long, ActiveHttp3Request> _ActiveRequests = new Dictionary<long, ActiveHttp3Request>();
         private readonly SemaphoreSlim _ControlStreamWriteLock = new SemaphoreSlim(1, 1);
         private QuicStream _OutboundControlStream = null;
         private QuicStream _OutboundQpackEncoderStream = null;
@@ -68,6 +74,13 @@ namespace WatsonWebserver.Http3
         private bool _ConnectionClosing = false;
         private long _LastAcceptedBidirectionalStreamId = 0;
         private CancellationTokenSource _AcceptTimeoutTokenSource = null;
+
+        private sealed class ActiveHttp3Request
+        {
+            public HttpContextBase Context { get; set; } = null;
+
+            public CancellationTokenSource TokenSource { get; set; } = null;
+        }
 
         /// <summary>
         /// Run the session.
@@ -137,6 +150,7 @@ namespace WatsonWebserver.Http3
             }
             catch (QuicException)
             {
+                CancelActiveRequests(true);
             }
             finally
             {
@@ -260,7 +274,7 @@ namespace WatsonWebserver.Http3
 
             try
             {
-                Http3MessageBody message = await Http3MessageSerializer.ReadMessageAsync(stream, CancellationToken.None).ConfigureAwait(false);
+                Http3MessageBody message = await Http3MessageSerializer.ReadMessageAsync(stream, token).ConfigureAwait(false);
                 if (TryGetDebugLogPath(out string debugLogPath))
                 {
                     DebugLog(debugLogPath, "request-header-block=" + Convert.ToHexString(message.Headers.HeaderBlock));
@@ -269,9 +283,20 @@ namespace WatsonWebserver.Http3
                 Http3Request request = BuildRequest(message);
                 Http3Response response = new Http3Response(request, _Settings, stream);
                 context = new Http3Context(_Settings, request, response, BuildConnectionMetadata, BuildStreamMetadata);
-                requestTokenSource = new CancellationTokenSource();
+                requestTokenSource = CancellationTokenSource.CreateLinkedTokenSource(token);
                 context.TokenSource = requestTokenSource;
-                await _ProcessContext(context, requestTokenSource.Token).ConfigureAwait(false);
+                RegisterActiveRequest(stream.Id, context, requestTokenSource);
+
+                Task disconnectMonitor = MonitorHttp3DisconnectAsync(stream, context, requestTokenSource.Token);
+                try
+                {
+                    await _ProcessContext(context, requestTokenSource.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    requestTokenSource.Cancel();
+                    await disconnectMonitor.ConfigureAwait(false);
+                }
             }
             catch (Http3ProtocolException e)
             {
@@ -285,11 +310,24 @@ namespace WatsonWebserver.Http3
             catch (OperationCanceledException)
             {
             }
+            catch (QuicException)
+            {
+                if (context != null)
+                {
+                    _MarkRequestTerminated(context, true);
+                }
+            }
             catch (IOException)
             {
+                if (context != null)
+                {
+                    _MarkRequestTerminated(context, true);
+                }
             }
             finally
             {
+                RemoveActiveRequest(stream.Id);
+
                 if (context != null)
                 {
                     context.Dispose();
@@ -573,6 +611,95 @@ namespace WatsonWebserver.Http3
             lock (_Lock)
             {
                 _ActiveStreamTasks.Add(streamTask);
+            }
+        }
+
+        private void RegisterActiveRequest(long streamIdentifier, HttpContextBase context, CancellationTokenSource tokenSource)
+        {
+            if (context == null) throw new ArgumentNullException(nameof(context));
+            if (tokenSource == null) throw new ArgumentNullException(nameof(tokenSource));
+
+            ActiveHttp3Request activeRequest = new ActiveHttp3Request();
+            activeRequest.Context = context;
+            activeRequest.TokenSource = tokenSource;
+
+            lock (_Lock)
+            {
+                _ActiveRequests[streamIdentifier] = activeRequest;
+            }
+        }
+
+        private void RemoveActiveRequest(long streamIdentifier)
+        {
+            lock (_Lock)
+            {
+                if (_ActiveRequests.ContainsKey(streamIdentifier))
+                {
+                    _ActiveRequests.Remove(streamIdentifier);
+                }
+            }
+        }
+
+        private void CancelActiveRequests(bool requestorDisconnected)
+        {
+            List<ActiveHttp3Request> activeRequests = new List<ActiveHttp3Request>();
+
+            lock (_Lock)
+            {
+                foreach (KeyValuePair<long, ActiveHttp3Request> activeRequest in _ActiveRequests)
+                {
+                    activeRequests.Add(activeRequest.Value);
+                }
+
+                _ActiveRequests.Clear();
+            }
+
+            for (int i = 0; i < activeRequests.Count; i++)
+            {
+                MarkAndCancelActiveRequest(activeRequests[i], requestorDisconnected);
+            }
+        }
+
+        private void MarkAndCancelActiveRequest(ActiveHttp3Request activeRequest, bool requestorDisconnected)
+        {
+            if (activeRequest == null) return;
+
+            if (activeRequest.Context != null)
+            {
+                _MarkRequestTerminated(activeRequest.Context, requestorDisconnected);
+            }
+
+            if (activeRequest.TokenSource != null && !activeRequest.TokenSource.IsCancellationRequested)
+            {
+                activeRequest.TokenSource.Cancel();
+            }
+        }
+
+        private async Task MonitorHttp3DisconnectAsync(QuicStream stream, HttpContextBase context, CancellationToken token)
+        {
+            if (stream == null || context == null) return;
+
+            Task cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, token);
+            Task completedTask = null;
+
+            try
+            {
+                completedTask = await Task.WhenAny(stream.WritesClosed, cancellationTask).ConfigureAwait(false);
+                if (completedTask == stream.WritesClosed && !context.Response.ResponseStarted)
+                {
+                    try
+                    {
+                        await stream.WritesClosed.ConfigureAwait(false);
+                    }
+                    catch (Exception)
+                    {
+                    }
+
+                    _MarkRequestTerminated(context, true);
+                }
+            }
+            catch (OperationCanceledException)
+            {
             }
         }
 

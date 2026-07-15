@@ -622,7 +622,8 @@
                     Settings,
                     Events,
                     quicConnection,
-                    async (httpContext, cancellationToken) => await ProcessHttpContextAsync(httpContext, _Header, cancellationToken).ConfigureAwait(false));
+                    async (httpContext, cancellationToken) => await ProcessHttpContextAsync(httpContext, _Header, cancellationToken).ConfigureAwait(false),
+                    MarkRequestTerminated);
                 await session.RunAsync(token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -658,6 +659,7 @@
 
             Stream stream = tcpClient.GetStream();
             ClientStreamContext context = new ClientStreamContext();
+            context.Socket = tcpClient.Client;
 
             if (!Settings.Ssl.Enable)
             {
@@ -779,6 +781,7 @@
                         Events,
                         clientStream,
                         async (httpContext, cancellationToken) => await ProcessHttpContextAsync(httpContext, _Header, cancellationToken).ConfigureAwait(false),
+                        MarkRequestTerminated,
                         sourceEndpoint,
                         destinationEndpoint,
                         Settings.Ssl.Enable);
@@ -836,7 +839,17 @@
                                 ctx = RentHttpContext(clientStream, requestMetadata);
                                 ctx.TokenSource = CancellationTokenSource.CreateLinkedTokenSource(token);
 
-                                await ProcessHttpContextAsync(ctx, _Header, ctx.Token).ConfigureAwait(false);
+                                Task disconnectMonitor = MonitorHttp1DisconnectAsync(streamContext, ctx, ctx.Token);
+                                try
+                                {
+                                    await ProcessHttpContextAsync(ctx, _Header, ctx.Token).ConfigureAwait(false);
+                                }
+                                finally
+                                {
+                                    ctx.CancelRequestToken();
+                                    await disconnectMonitor.ConfigureAwait(false);
+                                }
+
                                 keepAlive = ShouldKeepConnectionOpen(ctx);
                                 firstRequest = false;
                             }
@@ -891,6 +904,74 @@
                 catch (Exception)
                 {
                 }
+            }
+        }
+
+        private async Task MonitorHttp1DisconnectAsync(ClientStreamContext streamContext, HttpContextBase ctx, CancellationToken token)
+        {
+            if (streamContext == null || streamContext.Socket == null || ctx == null) return;
+
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    if (IsRequestBodyComplete(ctx) && IsSocketDisconnected(streamContext.Socket))
+                    {
+                        if (!ctx.Response.ResponseCompleted)
+                        {
+                            MarkRequestTerminated(ctx, true);
+                        }
+
+                        return;
+                    }
+
+                    await Task.Delay(50, token).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+                if (!ctx.Response.ResponseCompleted)
+                {
+                    MarkRequestTerminated(ctx, true);
+                }
+            }
+            catch (SocketException)
+            {
+                if (!ctx.Response.ResponseCompleted)
+                {
+                    MarkRequestTerminated(ctx, true);
+                }
+            }
+        }
+
+        private static bool IsRequestBodyComplete(HttpContextBase ctx)
+        {
+            if (ctx == null) return false;
+
+            HttpRequest request = ctx.Request as HttpRequest;
+            if (request == null) return true;
+
+            return request.IsRequestBodyComplete;
+        }
+
+        private static bool IsSocketDisconnected(Socket socket)
+        {
+            if (socket == null) return false;
+
+            try
+            {
+                return socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0;
+            }
+            catch (ObjectDisposedException)
+            {
+                return true;
+            }
+            catch (SocketException)
+            {
+                return true;
             }
         }
 

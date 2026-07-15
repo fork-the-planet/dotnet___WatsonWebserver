@@ -23,6 +23,7 @@ namespace WatsonWebserver.Http2
         /// <param name="events">Server events.</param>
         /// <param name="stream">Transport stream.</param>
         /// <param name="processContext">Shared request processor.</param>
+        /// <param name="markRequestTerminated">Request termination callback.</param>
         /// <param name="source">Source endpoint.</param>
         /// <param name="destination">Destination endpoint.</param>
         /// <param name="encrypted">True if the connection is encrypted.</param>
@@ -31,6 +32,7 @@ namespace WatsonWebserver.Http2
             WebserverEvents events,
             Stream stream,
             Func<HttpContextBase, CancellationToken, Task> processContext,
+            Action<HttpContextBase, bool> markRequestTerminated,
             IPEndPoint source,
             IPEndPoint destination,
             bool encrypted)
@@ -39,6 +41,7 @@ namespace WatsonWebserver.Http2
             if (events == null) throw new ArgumentNullException(nameof(events));
             if (stream == null) throw new ArgumentNullException(nameof(stream));
             if (processContext == null) throw new ArgumentNullException(nameof(processContext));
+            if (markRequestTerminated == null) throw new ArgumentNullException(nameof(markRequestTerminated));
             if (source == null) throw new ArgumentNullException(nameof(source));
             if (destination == null) throw new ArgumentNullException(nameof(destination));
 
@@ -46,6 +49,7 @@ namespace WatsonWebserver.Http2
             _Events = events;
             _Stream = stream;
             _ProcessContext = processContext;
+            _MarkRequestTerminated = markRequestTerminated;
             _Source = source;
             _Destination = destination;
             _Encrypted = encrypted;
@@ -102,10 +106,12 @@ namespace WatsonWebserver.Http2
             }
             catch (EndOfStreamException)
             {
+                CancelActiveRequests(true);
                 _State = Http2ConnectionState.Closed;
             }
             catch (IOException)
             {
+                CancelActiveRequests(true);
                 _State = Http2ConnectionState.Closed;
             }
             finally
@@ -143,6 +149,7 @@ namespace WatsonWebserver.Http2
         private readonly WebserverEvents _Events;
         private readonly Stream _Stream;
         private readonly Func<HttpContextBase, CancellationToken, Task> _ProcessContext;
+        private readonly Action<HttpContextBase, bool> _MarkRequestTerminated;
         private readonly IPEndPoint _Source;
         private readonly IPEndPoint _Destination;
         private readonly bool _Encrypted;
@@ -153,7 +160,7 @@ namespace WatsonWebserver.Http2
         private readonly Dictionary<int, Http2StreamStateMachine> _Streams = new Dictionary<int, Http2StreamStateMachine>();
         private readonly Dictionary<int, Http2PendingRequest> _PendingRequests = new Dictionary<int, Http2PendingRequest>();
         private readonly Dictionary<int, Task> _ActiveRequestTasks = new Dictionary<int, Task>();
-        private readonly Dictionary<int, CancellationTokenSource> _ActiveRequestTokens = new Dictionary<int, CancellationTokenSource>();
+        private readonly Dictionary<int, ActiveHttp2Request> _ActiveRequests = new Dictionary<int, ActiveHttp2Request>();
         private readonly Dictionary<int, int> _StreamReceiveWindows = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _StreamSendWindows = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _PendingStreamReceiveWindowUpdates = new Dictionary<int, int>();
@@ -167,6 +174,13 @@ namespace WatsonWebserver.Http2
         private int _PendingConnectionReceiveWindowUpdate = 0;
         private CancellationTokenSource _ReadTimeoutTokenSource = null;
         private readonly HpackDecoderContext _HpackDecoderContext;
+
+        private sealed class ActiveHttp2Request
+        {
+            public HttpContextBase Context { get; set; } = null;
+
+            public CancellationTokenSource TokenSource { get; set; } = null;
+        }
 
         private async Task HandleFrameAsync(Http2ConnectionWriter writer, Http2RawFrame frame, CancellationToken token)
         {
@@ -392,7 +406,7 @@ namespace WatsonWebserver.Http2
                 context = new Http2Context(_Settings, request, response, BuildConnectionMetadata, BuildStreamMetadata);
                 requestTokenSource = CancellationTokenSource.CreateLinkedTokenSource(token);
                 context.TokenSource = requestTokenSource;
-                RegisterActiveRequestToken(streamIdentifier, requestTokenSource);
+                RegisterActiveRequest(streamIdentifier, context, requestTokenSource);
                 await _ProcessContext(context, requestTokenSource.Token).ConfigureAwait(false);
             }
             catch (Http2ProtocolException ex)
@@ -403,9 +417,23 @@ namespace WatsonWebserver.Http2
             {
                 await SendGoAwayAsync(writer, streamIdentifier, Http2ErrorCode.ProtocolError, ex.Message, token).ConfigureAwait(false);
             }
+            catch (IOException)
+            {
+                if (context != null)
+                {
+                    _MarkRequestTerminated(context, true);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                if (context != null)
+                {
+                    _MarkRequestTerminated(context, true);
+                }
+            }
             finally
             {
-                RemoveActiveRequestToken(streamIdentifier);
+                RemoveActiveRequest(streamIdentifier);
 
                 if (stateMachine.State == Http2StreamState.Closed)
                 {
@@ -1148,42 +1176,79 @@ namespace WatsonWebserver.Http2
             }
         }
 
-        private void RegisterActiveRequestToken(int streamIdentifier, CancellationTokenSource requestTokenSource)
+        private void RegisterActiveRequest(int streamIdentifier, HttpContextBase context, CancellationTokenSource requestTokenSource)
         {
+            if (context == null) throw new ArgumentNullException(nameof(context));
             if (requestTokenSource == null) throw new ArgumentNullException(nameof(requestTokenSource));
+
+            ActiveHttp2Request activeRequest = new ActiveHttp2Request();
+            activeRequest.Context = context;
+            activeRequest.TokenSource = requestTokenSource;
 
             lock (_SessionLock)
             {
-                _ActiveRequestTokens[streamIdentifier] = requestTokenSource;
+                _ActiveRequests[streamIdentifier] = activeRequest;
             }
         }
 
-        private void RemoveActiveRequestToken(int streamIdentifier)
+        private void RemoveActiveRequest(int streamIdentifier)
         {
             lock (_SessionLock)
             {
-                if (_ActiveRequestTokens.ContainsKey(streamIdentifier))
+                if (_ActiveRequests.ContainsKey(streamIdentifier))
                 {
-                    _ActiveRequestTokens.Remove(streamIdentifier);
+                    _ActiveRequests.Remove(streamIdentifier);
                 }
             }
         }
 
         private void CancelActiveRequest(int streamIdentifier)
         {
-            CancellationTokenSource requestTokenSource = null;
+            ActiveHttp2Request activeRequest = null;
 
             lock (_SessionLock)
             {
-                if (_ActiveRequestTokens.TryGetValue(streamIdentifier, out requestTokenSource))
+                if (_ActiveRequests.TryGetValue(streamIdentifier, out activeRequest))
                 {
-                    _ActiveRequestTokens.Remove(streamIdentifier);
+                    _ActiveRequests.Remove(streamIdentifier);
                 }
             }
 
-            if (requestTokenSource != null && !requestTokenSource.IsCancellationRequested)
+            MarkAndCancelActiveRequest(activeRequest, true);
+        }
+
+        private void CancelActiveRequests(bool requestorDisconnected)
+        {
+            List<ActiveHttp2Request> activeRequests = new List<ActiveHttp2Request>();
+
+            lock (_SessionLock)
             {
-                requestTokenSource.Cancel();
+                foreach (KeyValuePair<int, ActiveHttp2Request> activeRequest in _ActiveRequests)
+                {
+                    activeRequests.Add(activeRequest.Value);
+                }
+
+                _ActiveRequests.Clear();
+            }
+
+            for (int i = 0; i < activeRequests.Count; i++)
+            {
+                MarkAndCancelActiveRequest(activeRequests[i], requestorDisconnected);
+            }
+        }
+
+        private void MarkAndCancelActiveRequest(ActiveHttp2Request activeRequest, bool requestorDisconnected)
+        {
+            if (activeRequest == null) return;
+
+            if (activeRequest.Context != null)
+            {
+                _MarkRequestTerminated(activeRequest.Context, requestorDisconnected);
+            }
+
+            if (activeRequest.TokenSource != null && !activeRequest.TokenSource.IsCancellationRequested)
+            {
+                activeRequest.TokenSource.Cancel();
             }
         }
 
@@ -1275,4 +1340,3 @@ namespace WatsonWebserver.Http2
         }
     }
 }
-
